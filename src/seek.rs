@@ -57,6 +57,17 @@ pub(crate) fn expr_contains_positional_anchor(expr: &Expr) -> bool {
     }
 }
 
+/// Cap on the seek-pattern buffer length. Inlining a backref/subroutine
+/// substitutes the referenced group's body, and when that body transitively
+/// references the same group (e.g. `(\s+((\3|\4|\5)))?` where `\4`/`\5` point
+/// at ancestors of the backref) the substitution branches at every level and,
+/// bounded only by the recursion depth, expands the buffer exponentially — so
+/// a short pattern can produce a multi-megabyte seek string. Once the buffer
+/// is already this large, further inlining stops and a permissive placeholder
+/// is emitted instead: the seek pattern only narrows candidate start positions
+/// and never decides matches, so a less-selective approximation stays correct.
+pub(crate) const MAX_SEEK_PATTERN_LEN: usize = 4096;
+
 /// Emit a permissive size placeholder — `(?s:.)+` or `(?s:.){N,}` — into `buf`.
 ///
 /// Used when a hard node cannot be represented in the seek pattern but has a known minimum
@@ -277,7 +288,7 @@ pub(crate) fn build_seek_pattern_impl<'a>(
             //
             // If inlining is not possible (depth limit, group not in map), emit a permissive
             // placeholder so that no match positions are incorrectly skipped.
-            if depth < MAX_SUBROUTINE_RECURSION_DEPTH {
+            if depth < MAX_SUBROUTINE_RECURSION_DEPTH && buf.len() < MAX_SEEK_PATTERN_LEN {
                 if let Some(group_info) = group_info_map.get(group) {
                     if !group_info.children.is_empty() {
                         let child = &group_info.children[0];
@@ -319,7 +330,7 @@ pub(crate) fn build_seek_pattern_impl<'a>(
         }
         Expr::SubroutineCall(target_group) => {
             // Inline the body of the target group, honouring the recursion depth limit.
-            if depth < MAX_SUBROUTINE_RECURSION_DEPTH {
+            if depth < MAX_SUBROUTINE_RECURSION_DEPTH && buf.len() < MAX_SEEK_PATTERN_LEN {
                 if let Some(group_info) = group_info_map.get(target_group) {
                     if !group_info.children.is_empty() {
                         build_seek_pattern_impl(
@@ -484,6 +495,7 @@ mod tests {
     use crate::analyze::{analyze, AnalyzeContext};
     use crate::compile::populate_group_info_map;
     use crate::optimize;
+    use crate::Regex;
 
     /// Build the seek pattern for a regex string and return it.
     fn get_seek_pattern(re: &str) -> String {
@@ -611,5 +623,21 @@ mod tests {
         // dropped when inlining the group body for the backref.
         // `(a\Z)\1` — seek = `(?:a\n*$)` (group) + `(?:a\n*)` (backref, \Z anchor dropped, newline matching kept)
         assert_eq!(get_seek_pattern(r"(a\Z)\1"), r"(?:a\n*$)(?:a\n*)");
+    }
+
+    #[test]
+    fn seek_pattern_self_referential_backref_is_bounded() {
+        // Inlining a backref whose target transitively references the backref's
+        // own ancestors expands exponentially with recursion depth. The length
+        // cap must keep the seek pattern small (and, therefore, compilation
+        // fast) rather than producing a multi-megabyte string.
+        let seek = get_seek_pattern(r"(end)(\s+(function))?(\s+((\3|\4|\5)))?");
+        assert!(
+            seek.len() < 2 * MAX_SEEK_PATTERN_LEN,
+            "seek pattern should stay bounded, got {} bytes",
+            seek.len()
+        );
+        // Compiling it must succeed and stay well-formed.
+        Regex::new(r"(end)(\s+(function))?(\s+((\3|\4|\5)))?").unwrap();
     }
 }
