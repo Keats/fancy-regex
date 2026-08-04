@@ -72,14 +72,6 @@ impl<'a> Info<'a> {
         self.capture_groups.end()
     }
 
-    pub(crate) fn is_literal(&self) -> bool {
-        match *self.expr {
-            Expr::Literal { casei, .. } => !casei,
-            Expr::Concat(_) => self.children.iter().all(|child| child.is_literal()),
-            _ => false,
-        }
-    }
-
     pub(crate) fn push_literal(&self, buf: &mut String) {
         match *self.expr {
             // could be more paranoid about checking casei
@@ -90,6 +82,32 @@ impl<'a> Info<'a> {
                 }
             }
             _ => panic!("push_literal called on non-literal"),
+        }
+    }
+
+    /// `None` if this is not a literal; `Some(casei)` if it is, where `casei`
+    /// says whether any character is case-insensitive.
+    pub(crate) fn literal_casei(&self) -> Option<bool> {
+        match *self.expr {
+            Expr::Literal { casei, .. } => Some(casei),
+            Expr::Concat(_) => self
+                .children
+                .iter()
+                .try_fold(false, |any, child| child.literal_casei().map(|c| any || c)),
+            _ => None,
+        }
+    }
+
+    /// Pushes each character of the literal along with its case-insensitivity.
+    pub(crate) fn push_literal_chars(&self, buf: &mut Vec<(char, bool)>) {
+        match *self.expr {
+            Expr::Literal { ref val, casei } => buf.extend(val.chars().map(|c| (c, casei))),
+            Expr::Concat(_) => {
+                for child in &self.children {
+                    child.push_literal_chars(buf);
+                }
+            }
+            _ => panic!("push_literal_chars called on non-literal"),
         }
     }
 }
@@ -1350,14 +1368,21 @@ mod tests {
     fn is_literal() {
         let tree = Expr::parse_tree("abc").unwrap();
         let info = analyze(&tree, AnalyzeContext::default()).unwrap();
-        assert_eq!(info.is_literal(), true);
+        assert_eq!(info.literal_casei(), Some(false));
+    }
+
+    #[test]
+    fn is_literal_casei() {
+        let tree = Expr::parse_tree("(?i)abc").unwrap();
+        let info = analyze(&tree, AnalyzeContext::default()).unwrap();
+        assert_eq!(info.literal_casei(), Some(true));
     }
 
     #[test]
     fn is_literal_with_repeat() {
         let tree = Expr::parse_tree("abc*").unwrap();
         let info = analyze(&tree, AnalyzeContext::default()).unwrap();
-        assert_eq!(info.is_literal(), false);
+        assert_eq!(info.literal_casei(), None);
     }
 
     #[test]

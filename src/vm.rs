@@ -204,6 +204,62 @@ impl CharClassMatcher {
     }
 }
 
+/// A case-insensitive literal, matched natively by the VM instead of being
+/// delegated to a `meta::Regex` engine.
+///
+/// A case-insensitive alternation branch such as `(?i)abort` is a run of
+/// literal characters; delegating each branch to its own engine makes build
+/// cost scale with the number of branches. Like [`CharClassMatcher`],
+/// membership can be tested directly: one sorted range set per original
+/// character, holding its Unicode simple case-fold class (a singleton for
+/// case-sensitive characters). The fold classes come from `regex-syntax`, so
+/// the matched set is identical to what the delegated `(?i)` engine would
+/// accept — including width-changing variants such as `k` ↔ U+212A KELVIN
+/// SIGN, which is why matching advances codepoint by codepoint instead of
+/// assuming the literal's own byte length.
+///
+/// Only built in Unicode bytes mode (the haystack is valid UTF-8).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaseiLiteral {
+    chars: Box<[FoldRanges]>,
+}
+
+/// The characters matching one literal character, as sorted inclusive ranges
+/// (its simple case-fold class, or a singleton when case-sensitive).
+pub(crate) type FoldRanges = Box<[(char, char)]>;
+
+impl CaseiLiteral {
+    pub(crate) fn new(chars: Box<[FoldRanges]>) -> Self {
+        CaseiLiteral { chars }
+    }
+
+    /// If the literal matches at `ix`, returns the matched byte length (which
+    /// can differ from the literal's own length under folding). `None` on no
+    /// match or end of input.
+    fn match_len<S: HaystackInput + ?Sized>(&self, s: &S, ix: usize) -> Option<usize> {
+        let bytes = s.as_bytes();
+        let mut pos = ix;
+        for ranges in &self.chars {
+            if pos >= bytes.len() {
+                return None;
+            }
+            let len = codepoint_len(bytes[pos]);
+            let end = pos + len;
+            if end > bytes.len() {
+                return None;
+            }
+            // The haystack is valid UTF-8 in Unicode mode, so this decodes the
+            // codepoint; the `?` is a safety net for an unexpected boundary.
+            let c = core::str::from_utf8(&bytes[pos..end]).ok()?.chars().next()?;
+            if !range_contains(ranges, c) {
+                return None;
+            }
+            pos = end;
+        }
+        Some(pos - ix)
+    }
+}
+
 /// Binary-searches `ranges` (sorted, non-overlapping, inclusive) for `needle`.
 #[inline]
 fn range_contains<T: Ord + Copy>(ranges: &[(T, T)], needle: T) -> bool {
@@ -329,6 +385,9 @@ pub enum Insn {
     Assertion(Assertion),
     /// Match the literal string at the current index
     Lit(String), // should be cow?
+    /// Match a case-insensitive literal at the current index, without
+    /// delegating to a regex-automata engine.
+    LitCasei(CaseiLiteral),
     /// Match a single character class (e.g. `\d`, `[a-z]`) at the current index,
     /// without delegating to a regex-automata engine.
     CharClass(CharClassMatcher),
@@ -999,6 +1058,10 @@ fn run_with<S: HaystackInput + ?Sized, T>(
                     }
                     ix = ix_end
                 }
+                Insn::LitCasei(ref lit) => match lit.match_len(haystack, ix) {
+                    Some(len) => ix += len,
+                    None => break 'fail,
+                },
                 Insn::CharClass(ref matcher) => match matcher.match_len(haystack, ix) {
                     Some(len) => ix += len,
                     None => break 'fail,

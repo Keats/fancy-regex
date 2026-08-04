@@ -1060,3 +1060,42 @@ fn ambiguous_concat_repeat_optimization_not_more_permissive() {
     common::assert_no_match(r"^\s+\w?\s*$", "");
     common::assert_no_match(r"^\s+\w?\s*$", "a");
 }
+
+#[test]
+fn casei_literal_in_hard_pattern() {
+    // Lookbehind forces these onto the VM, where casei literals are matched
+    // by the native LitCasei instruction. Semantics must equal a delegated
+    // (?i) literal: Unicode simple case folding.
+    common::assert_is_match(r"(?<=x)(?i)kelvin", "xKELVIN");
+    common::assert_is_match(r"(?<=x)(?i)KELVIN", "xkelvin");
+    common::assert_no_match(r"(?<=x)(?i)kelvin", "xKELVIM");
+
+    // Mixed casei and case-sensitive chars in one literal batch
+    common::assert_is_match(r"(?<=x)(?i:ab)cd", "xABcd");
+    common::assert_no_match(r"(?<=x)(?i:ab)cd", "xABCD");
+
+    // Unicode folding applies in str mode only (the shared both-modes helpers
+    // also run in ASCII bytes mode, where (?i) folds ASCII only).
+    let is_match =
+        |re: &str, text: &str| fancy_regex::Regex::new(re).unwrap().is_match(text).unwrap();
+
+    // Cyrillic folding
+    assert!(is_match(r"(?<=x)(?i)привет", "xПРИВЕТ"));
+    assert!(is_match(r"(?<=x)(?i)ПРИВЕТ", "xпривет"));
+
+    // Width-changing fold variants: U+212A KELVIN SIGN (3 bytes) matches
+    // literal `k` (1 byte), and U+017F LATIN SMALL LETTER LONG S matches `s`.
+    assert!(is_match(r"(?<=x)(?i)k", "x\u{212A}"));
+    assert!(is_match(r"(?<=x)(?i)s", "x\u{17F}"));
+}
+
+#[test]
+fn casei_keyword_alternation_in_hard_pattern() {
+    let haystack = "if ABSENT then";
+    let m = fancy_regex::Regex::new(r"\b(?i)(abort|absent|zzz)\b")
+        .unwrap()
+        .find(haystack)
+        .unwrap()
+        .unwrap();
+    assert_eq!(&haystack[m.start()..m.end()], "ABSENT");
+}

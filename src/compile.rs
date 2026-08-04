@@ -44,7 +44,7 @@ use crate::seek::build_seek_pattern;
 use crate::to_hir::{expr_to_hir, HirCtx};
 #[cfg(feature = "variable-lookbehinds")]
 use crate::vm::{CachePoolFn, ReverseBackwardsDelegate};
-use crate::vm::{CaptureGroupRange, CharClassMatcher, Delegate, Insn, Prog, Seek};
+use crate::vm::{CaptureGroupRange, CaseiLiteral, CharClassMatcher, Delegate, Insn, Prog, Seek};
 use crate::LookAround::*;
 use crate::{
     Absent, BacktrackingControlVerb, BytesMode, CompileError, Error, Expr, LookAround, Result,
@@ -826,15 +826,33 @@ impl<'a> Compiler<'a> {
         if infos.is_empty() {
             return Ok(());
         }
-        // TODO: might want to do something similar for case insensitive literals
-        // (have is_literal return an additional bool for casei)
-        if infos.iter().all(|e| e.is_literal()) {
-            let mut val = String::new();
-            for info in infos {
-                info.push_literal(&mut val);
+        // A batch that is entirely literal compiles to a native literal
+        // instruction instead of a delegated engine. Case-sensitive literals
+        // become a plain byte-compare `Lit`; batches containing
+        // case-insensitive characters become a `LitCasei` (Unicode mode only —
+        // see `try_casei_literal`). This keeps each literal branch of an
+        // alternation off a per-branch delegated engine, so build cost does not
+        // scale with the number of branches.
+        if let Some(any_casei) = infos
+            .iter()
+            .try_fold(false, |any, e| e.literal_casei().map(|c| any || c))
+        {
+            if !any_casei {
+                let mut val = String::new();
+                for info in infos {
+                    info.push_literal(&mut val);
+                }
+                self.b.add(Insn::Lit(val));
+                return Ok(());
             }
-            self.b.add(Insn::Lit(val));
-            return Ok(());
+            let mut chars = Vec::new();
+            for info in infos {
+                info.push_literal_chars(&mut chars);
+            }
+            if let Some(lit) = self.try_casei_literal(&chars) {
+                self.b.add(Insn::LitCasei(lit));
+                return Ok(());
+            }
         }
 
         let mut delegate_builder = DelegateBuilder::new(&self.options);
@@ -850,20 +868,40 @@ impl<'a> Compiler<'a> {
     }
 
     fn compile_delegate(&mut self, info: &Info) -> Result<()> {
-        if info.is_literal() {
-            let mut val = String::new();
-            info.push_literal(&mut val);
-            self.b.add(Insn::Lit(val));
-        } else {
-            let mut builder = DelegateBuilder::new(&self.options);
-            builder.push(info);
-            // Skip emitting a delegate for an empty regex (e.g. DefineGroup),
-            // as it would just match the empty string and is a no-op.
-            if !builder.is_empty() {
-                self.b.add(builder.build(&self.options)?);
-            }
+        self.compile_delegates(core::slice::from_ref(info))
+    }
+
+    /// Builds a [`CaseiLiteral`] from `(char, casei)` pairs: each
+    /// case-insensitive character contributes its Unicode simple case-fold
+    /// class (what a delegated `(?i)` literal matches), each case-sensitive
+    /// one a singleton. `None` when the fold semantics wouldn't match a
+    /// delegated engine's — non-Unicode syntax folds ASCII-only, and non-UTF-8
+    /// haystacks can't be decoded per codepoint — so the caller falls back to
+    /// a delegate.
+    fn try_casei_literal(&self, chars: &[(char, bool)]) -> Option<CaseiLiteral> {
+        use regex_syntax::hir::{ClassUnicode, ClassUnicodeRange};
+
+        if !self.options.unicode || !matches!(self.options.bytes_mode, BytesMode::Unicode) {
+            return None;
         }
-        Ok(())
+        let mut out = Vec::with_capacity(chars.len());
+        for &(c, casei) in chars {
+            let ranges: Box<[(char, char)]> = if casei {
+                let mut class = ClassUnicode::new([ClassUnicodeRange::new(c, c)]);
+                // Errs when regex-syntax was built without its case-folding
+                // tables; the delegate fallback handles it the old way.
+                class.try_case_fold_simple().ok()?;
+                class
+                    .ranges()
+                    .iter()
+                    .map(|r| (r.start(), r.end()))
+                    .collect()
+            } else {
+                Box::new([(c, c)])
+            };
+            out.push(ranges);
+        }
+        Some(CaseiLiteral::new(out.into()))
     }
 
     fn compile_general_newline(&mut self, unicode: bool) -> Result<()> {
@@ -1393,6 +1431,39 @@ mod tests {
                 other.err()
             ),
         }
+    }
+
+    #[test]
+    fn casei_literal_compiles_to_native_insn() {
+        // A case-insensitive literal inside a hard pattern becomes a single
+        // native LitCasei instruction, not a delegated engine.
+        let prog = compile_prog_forced_hard("(?i)abc");
+        assert_eq!(prog.len(), 2, "prog: {:?}", prog);
+        assert_matches!(prog[0], LitCasei(_));
+        assert_matches!(prog[1], End);
+    }
+
+    #[test]
+    fn casei_alternation_branches_compile_to_native_insns() {
+        // A hard element in one branch forces the alternation to compile
+        // branch by branch on the VM (a fully-easy alternation would be
+        // delegated whole). The literal branches must become native LitCasei
+        // instructions instead of one delegated engine each.
+        let prog = compile_prog_forced_hard("(?i)(abort|absent|z(?<=q)z)");
+        let count = prog
+            .iter()
+            .filter(|insn| matches!(insn, LitCasei(_)))
+            .count();
+        assert!(
+            count >= 2,
+            "literal branches should compile to LitCasei: {:?}",
+            prog
+        );
+        assert!(
+            prog.iter().all(|insn| !matches!(insn, Insn::Delegate(_))),
+            "no branch should need a forward delegate: {:?}",
+            prog
+        );
     }
 
     #[test]
