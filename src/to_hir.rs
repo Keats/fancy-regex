@@ -40,7 +40,7 @@ use core::convert::TryFrom;
 
 use regex_syntax::hir::{Capture, Dot, Hir, Look, Repetition};
 
-use crate::{push_quoted, Assertion, Expr};
+use crate::{push_quoted, Assertion, BytesMode, Expr, RegexOptions};
 
 /// Context threaded through a translation: the syntax options the string path
 /// would hand to the engine's parser, plus the capture-group counter (groups
@@ -55,6 +55,19 @@ pub(crate) struct HirCtx {
 impl HirCtx {
     pub(crate) fn new(unicode: bool, utf8: bool) -> Self {
         HirCtx {
+            unicode,
+            utf8,
+            next_group: 1,
+        }
+    }
+}
+
+impl From<&RegexOptions> for HirCtx {
+    fn from(options: &RegexOptions) -> Self {
+        let unicode =
+            options.syntaxc.get_unicode() && !matches!(options.bytes_mode, BytesMode::Ascii);
+        let utf8 = matches!(options.bytes_mode, BytesMode::Unicode);
+        Self {
             unicode,
             utf8,
             next_group: 1,
@@ -259,7 +272,8 @@ mod tests {
                 .unicode(unicode)
                 .build()
                 .parse(&cooked);
-            let got = expr_to_hir(&tree.expr, &mut HirCtx::new(unicode, utf8));
+            let mut hir_ctx = HirCtx::from(&options);
+            let got = expr_to_hir(&tree.expr, &mut hir_ctx);
             match expected {
                 Ok(hir) => assert_eq!(
                     Some(hir),

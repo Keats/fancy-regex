@@ -169,6 +169,24 @@ pub struct RegexSetOptions {
     bytes_mode: BytesMode,
 }
 
+/// The set-wide engines parse the members' seek patterns, so their syntax options have
+/// to be the ones the members were compiled with. Deriving the config from the same
+/// [`RegexOptions`] keeps the two from drifting apart.
+impl From<&RegexOptions> for RegexSetOptions {
+    fn from(options: &RegexOptions) -> Self {
+        RegexSetOptions {
+            syntaxc: options.syntaxc,
+            delegate_size_limit: options.delegate_size_limit,
+            delegate_dfa_size_limit: options.delegate_dfa_size_limit,
+            meta_nfa_size_limit: Some(DEFAULT_META_NFA_SIZE_LIMIT),
+            meta_hybrid_cache_capacity: DEFAULT_META_HYBRID_CACHE_CAPACITY,
+            overlapping_dfa_cache_capacity: DEFAULT_OVERLAPPING_DFA_CACHE_CAPACITY,
+            overlapping_dfa_skip_cache_capacity_check: true,
+            bytes_mode: options.bytes_mode,
+        }
+    }
+}
+
 impl Default for RegexSetOptions {
     fn default() -> Self {
         let default_options = RegexOptions::default();
@@ -249,6 +267,33 @@ impl RegexSetOptions {
     }
 }
 
+pub(crate) fn match_pattern_at_input_position<'t, S: Input + ?Sized>(
+    regex: &Regex,
+    pattern_index: usize,
+    input: &RegexInput<'t, S>,
+    match_start: usize,
+) -> Result<Option<RegexSetMatch<'t, S>>> {
+    let candidate_input = input.clone().from_pos(match_start).anchored(true);
+    let mut option_flags = 0;
+    if input.start() < match_start {
+        option_flags |= OPTION_NOT_CONTINUED_FROM_PREVIOUS_MATCH;
+    }
+    if regex.captures_len() == 1 {
+        return Ok(regex
+            .find_input_raw(&candidate_input, option_flags)?
+            .map(|(start, end)| RegexSetMatch {
+                pattern_index,
+                captures: regex.captures_for_span(input.haystack(), start, end),
+            }));
+    }
+    Ok(regex
+        .captures_input_with_option_flags(&candidate_input, option_flags)?
+        .map(|captures| RegexSetMatch {
+            pattern_index,
+            captures,
+        }))
+}
+
 impl RegexSet {
     /// Create a new RegexSet from an iterator of patterns using default options.
     ///
@@ -295,17 +340,7 @@ impl RegexSet {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let config = RegexSetOptions {
-            syntaxc: options_builder.options.syntaxc,
-            delegate_size_limit: options_builder.options.delegate_size_limit,
-            delegate_dfa_size_limit: options_builder.options.delegate_dfa_size_limit,
-            meta_nfa_size_limit: Some(DEFAULT_META_NFA_SIZE_LIMIT),
-            meta_hybrid_cache_capacity: DEFAULT_META_HYBRID_CACHE_CAPACITY,
-            overlapping_dfa_cache_capacity: DEFAULT_OVERLAPPING_DFA_CACHE_CAPACITY,
-            overlapping_dfa_skip_cache_capacity_check: true,
-            bytes_mode: options_builder.options.bytes_mode,
-        };
-        Self::from_regexes(regexes, config)
+        Self::from_regexes(regexes, RegexSetOptions::from(&options_builder.options))
     }
 
     /// Create a new RegexSet from pre-built `Arc<Regex>` instances.
@@ -521,9 +556,12 @@ impl RegexSet {
                 .map(|pattern| pattern.as_usize());
             let mut first_match = None;
             for pattern_index in &mut candidate_pattern_indices {
-                if let Some(candidate_match) =
-                    self.match_pattern_at_input_position(pattern_index, &input, match_start)?
-                {
+                if let Some(candidate_match) = match_pattern_at_input_position(
+                    &self.regexes[pattern_index],
+                    pattern_index,
+                    &input,
+                    match_start,
+                )? {
                     first_match = Some(candidate_match);
                     break;
                 }
@@ -545,34 +583,6 @@ impl RegexSet {
         }
 
         Ok(None)
-    }
-
-    fn match_pattern_at_input_position<'t, S: Input + ?Sized>(
-        &self,
-        pattern_index: usize,
-        input: &RegexInput<'t, S>,
-        match_start: usize,
-    ) -> Result<Option<RegexSetMatch<'t, S>>> {
-        let candidate_input = input.clone().from_pos(match_start).anchored(true);
-        let regex = &self.regexes[pattern_index];
-        let mut option_flags = 0;
-        if input.start() < match_start {
-            option_flags |= OPTION_NOT_CONTINUED_FROM_PREVIOUS_MATCH;
-        }
-        if regex.captures_len() == 1 {
-            return Ok(regex.find_input_raw(&candidate_input, option_flags)?.map(
-                |(start, end)| RegexSetMatch {
-                    pattern_index,
-                    captures: regex.captures_for_span(input.haystack(), start, end),
-                },
-            ));
-        }
-        Ok(regex
-            .captures_input_with_option_flags(&candidate_input, option_flags)?
-            .map(|captures| RegexSetMatch {
-                pattern_index,
-                captures,
-            }))
     }
 }
 
@@ -604,7 +614,7 @@ impl RegexSet {
 /// ```
 #[derive(Debug)]
 pub struct RegexSetMatch<'t, S: Input + ?Sized> {
-    pattern_index: usize,
+    pub(crate) pattern_index: usize,
     captures: Captures<'t, S>,
 }
 
@@ -689,7 +699,8 @@ impl<'r, 't, S: Input + ?Sized> Iterator for RegexSetMatchesAt<'r, 't, S> {
         }
 
         for pattern_index in self.pending_pattern_indices.by_ref() {
-            match self.regex_set.match_pattern_at_input_position(
+            match match_pattern_at_input_position(
+                &self.regex_set.regexes[pattern_index],
                 pattern_index,
                 &self.input,
                 self.match_start,

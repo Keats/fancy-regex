@@ -106,3 +106,15 @@ fn assert_test_cases(re: Arc<Regex>, test_cases: Vec<(&str, bool)>) {
         );
     }
 }
+
+#[test]
+fn test_lazy_regex_is_send_and_sync() {
+    assert_send::<fancy_regex::LazyRegex>();
+    assert_sync::<fancy_regex::LazyRegex>();
+}
+
+#[test]
+fn test_finder_is_send_and_sync() {
+    assert_send::<fancy_regex::Finder>();
+    assert_sync::<fancy_regex::Finder>();
+}
