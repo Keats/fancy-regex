@@ -626,6 +626,12 @@ impl<'a> Compiler<'a> {
                     ..
                 } = inner
                 {
+                    // One reverse-DFA delegate over the whole alternation is much cheaper per
+                    // attempt than trying every branch as its own const-size lookbehind
+                    #[cfg(feature = "variable-lookbehinds")]
+                    if !inner.hard {
+                        return self.compile_positive_lookaround(inner, la);
+                    }
                     // Make const size by transforming `(?<=a|bb)` to `(?<=a)|(?<=bb)`
                     let alternatives = &inner.children;
                     self.compile_alt(alternatives.len(), |compiler, i| {
@@ -643,6 +649,10 @@ impl<'a> Compiler<'a> {
                     ..
                 } = inner
                 {
+                    #[cfg(feature = "variable-lookbehinds")]
+                    if !inner.hard {
+                        return self.compile_negative_lookaround(inner, la);
+                    }
                     // Make const size by transforming `(?<!a|bb)` to `(?<!a)(?<!bb)`
                     let alternatives = &inner.children;
                     for alternative in alternatives {
