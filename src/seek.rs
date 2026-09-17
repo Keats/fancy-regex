@@ -353,10 +353,16 @@ pub(crate) fn build_seek_pattern_impl<'a>(
             emit_min_size_placeholder(buf, info.min_size, precedence);
         }
         Expr::SubroutineCall(target_group) => {
-            // Inline the body of the target group, honouring the recursion depth limit.
-            if depth < MAX_SUBROUTINE_RECURSION_DEPTH && buf.len() < MAX_SEEK_PATTERN_LEN {
+            // Inline the body once. A call that re-enters a group already being inlined is
+            // recursive: unrolling it MAX_SUBROUTINE_RECURSION_DEPTH deep only bloats the seek
+            // pattern, so over-approximate the recursion with a placeholder instead.
+            if depth < MAX_SUBROUTINE_RECURSION_DEPTH
+                && buf.len() < MAX_SEEK_PATTERN_LEN
+                && !inlined_groups.contains(target_group)
+            {
                 if let Some(group_info) = group_info_map.get(target_group) {
                     if !group_info.children.is_empty() {
+                        inlined_groups.push(*target_group);
                         build_seek_pattern_impl(
                             &group_info.children[0],
                             group_info_map,
@@ -366,6 +372,7 @@ pub(crate) fn build_seek_pattern_impl<'a>(
                             drop_positional_anchors,
                             inlined_groups,
                         );
+                        inlined_groups.pop();
                         return;
                     }
                     return;
