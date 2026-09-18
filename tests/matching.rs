@@ -150,12 +150,13 @@ fn is_match_input_respects_range_without_slicing() {
 
 #[test]
 fn backtrack_limit_hit_when_not_seeking() {
-    // Disable the seek pre-filter so the backtracking VM actually explores all positions and
-    // hits the limit.  With seek enabled the engine would correctly determine there is no `c`
-    // in the haystack and return `None` immediately without backtracking.
+    // Disable the seek and literal pre-filters so the backtracking VM actually explores all
+    // positions and hits the limit. With either enabled the engine would correctly determine
+    // there is no `c` in the haystack and return `None` immediately without backtracking.
     let re = RegexBuilder::new(r"(?i)(a|b|ab)*(?>c)")
         .backtrack_limit(100_000)
         .seek(false)
+        .build_literal_prefilter(false)
         .build()
         .expect("regex to compile successfully");
     let s = "abababababababababababababababababababababababababababab";
@@ -170,6 +171,7 @@ fn backtrack_limit_hit_when_not_seeking() {
     let re = RegexBuilder::new(r"(?i)(a|b|ab)*(?>c)")
         .bytes_mode(BytesMode::Ascii)
         .backtrack_limit(100_000)
+        .build_literal_prefilter(false)
         .build()
         .expect("regex to compile successfully");
     let s = b"abababababababababababababababababababababababababababab";

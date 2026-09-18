@@ -288,6 +288,7 @@ impl RegexSet {
         // consults a prefilter — skip spending build time and memory on one.
         let mut member_options = options_builder.options.clone();
         member_options.delegate_prefilter = false;
+        member_options.literal_prefilter = false;
         let regexes = patterns
             .into_iter()
             .map(|pattern| {

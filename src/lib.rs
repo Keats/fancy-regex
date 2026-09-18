@@ -57,6 +57,7 @@ mod compile;
 mod error;
 mod expand;
 mod input;
+mod literal;
 mod optimize;
 mod parse;
 mod parse_flags;
@@ -184,6 +185,8 @@ enum RegexImpl {
         /// The original pattern which the regex was constructed from
         pattern: String,
         options: HardRegexRuntimeOptions,
+        /// Skips unanchored searches of haystacks that lack every literal a match needs
+        literal_prefilter: Option<literal::LiteralPrefilter>,
     },
 }
 
@@ -524,6 +527,10 @@ struct RegexOptions {
     /// the set only ever searches them anchored at candidate positions, where
     /// a prefilter is never consulted, so building one wastes time and memory.
     delegate_prefilter: bool,
+    /// Whether a hard (`Fancy`) pattern should build a required-literal prefilter: literals
+    /// every match must contain, checked before the VM runs an unanchored search. `RegexSet`
+    /// turns this off for its members for the same reason as `delegate_prefilter`.
+    literal_prefilter: bool,
     #[cfg(feature = "leftmost_longest")]
     leftmost_longest: bool,
 }
@@ -552,7 +559,8 @@ impl fmt::Debug for RegexOptions {
                 &self.hard_regex_runtime_options,
             )
             .field("seek_filter", &seek_filter_desc)
-            .field("delegate_prefilter", &self.delegate_prefilter);
+            .field("delegate_prefilter", &self.delegate_prefilter)
+            .field("literal_prefilter", &self.literal_prefilter);
         #[cfg(feature = "leftmost_longest")]
         debug.field("leftmost_longest", &self.leftmost_longest);
         debug.finish()
@@ -571,6 +579,7 @@ impl Default for RegexOptions {
             bytes_mode: BytesMode::default(),
             seek_filter: None, // when we are ready to enable seek by default, use: `Some(seek_pattern_is_useful)`
             delegate_prefilter: true,
+            literal_prefilter: true,
             #[cfg(feature = "leftmost_longest")]
             leftmost_longest: false,
         }
@@ -1008,6 +1017,36 @@ impl RegexOptionsBuilder {
         self
     }
 
+    /// Whether to build a required-literal prefilter for a pattern that needs the backtracking
+    /// VM. Before an unanchored search the haystack is scanned for the literals every match
+    /// must contain, and the VM is skipped when none is present. This is what makes patterns
+    /// like `(?=.*sql)\w+` cheap on text that does not contain `sql`. Only anchored searches
+    /// never consult it, so turn it off if that is all you do.
+    pub fn build_literal_prefilter(&mut self, yes: bool) -> &mut Self {
+        self.options.literal_prefilter = yes;
+        self
+    }
+
+    /// Computes the literals of which at least one must appear in any match of `pattern`,
+    /// without compiling it, each with whether it is matched case-insensitively.
+    ///
+    /// - `Ok(Some(literals))`: a haystack containing none of them cannot match the pattern
+    /// - `Ok(None)`: no such set could be established
+    /// - `Err(..)`: the pattern is invalid
+    ///
+    /// This is useful if you are building your own prefilter.
+    ///
+    /// ```
+    /// # use fancy_regex::RegexOptionsBuilder;
+    /// let builder = RegexOptionsBuilder::new();
+    /// let lits = builder.required_literals(r"\s*(?i)sql(?=`)").unwrap().unwrap();
+    /// assert_eq!(lits, vec![("sql".to_string(), true)]);
+    /// assert!(builder.required_literals(r"a?").unwrap().is_none());
+    /// ```
+    pub fn required_literals(&self, pattern: &str) -> Result<Option<Vec<(String, bool)>>> {
+        crate::literal::required_literals_of(pattern, &self.options)
+    }
+
     /// Computes the bytes a match of `pattern` can start with, without compiling it.
     /// The possible return values are:
     ///
@@ -1151,6 +1190,12 @@ impl RegexBuilder {
         self
     }
 
+    /// See [`RegexOptionsBuilder::build_literal_prefilter`]
+    pub fn build_literal_prefilter(&mut self, yes: bool) -> &mut Self {
+        self.options.build_literal_prefilter(yes);
+        self
+    }
+
     /// See [`RegexOptionsBuilder::seek_filter`]
     pub fn seek_filter(&mut self, filter: fn(&str) -> bool) -> &mut Self {
         self.options.seek_filter(filter);
@@ -1291,6 +1336,11 @@ impl Regex {
             });
         }
 
+        let literal_prefilter = if options.literal_prefilter {
+            literal::LiteralPrefilter::from_expr(&tree.expr)
+        } else {
+            None
+        };
         let prog = compile(
             &info,
             CompileOptions {
@@ -1311,6 +1361,7 @@ impl Regex {
                 n_groups: info.end_group(),
                 options: options.hard_regex_runtime_options,
                 pattern,
+                literal_prefilter,
             },
             named_groups: Arc::new(tree.named_groups),
         })
@@ -1503,7 +1554,15 @@ impl Regex {
                 };
                 Ok(result)
             }
-            RegexImpl::Fancy { prog, options, .. } => {
+            RegexImpl::Fancy {
+                prog,
+                options,
+                literal_prefilter,
+                ..
+            } => {
+                if !literal_may_match(literal_prefilter, input) {
+                    return Ok(None);
+                }
                 #[allow(unused_mut)]
                 let mut option_flags = option_flags
                     | if options.find_not_empty {
@@ -1708,8 +1767,12 @@ impl Regex {
                 prog,
                 n_groups,
                 options,
+                literal_prefilter,
                 ..
             } => {
+                if !literal_may_match(literal_prefilter, input) {
+                    return Ok(None);
+                }
                 #[allow(unused_mut)]
                 let mut option_flags = option_flags
                     | if options.find_not_empty {
@@ -2039,6 +2102,22 @@ pub struct DebugRegex<'a>(pub &'a Regex);
 impl fmt::Display for DebugRegex<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         self.0.debug_print(f)
+    }
+}
+
+/// Whether the literal prefilter, if any, allows this search to proceed. Anchored searches
+/// never consult it: the match has to start at `input.start()`, which the VM rejects quickly.
+/// The scan runs to the end of the haystack rather than of the search range, since a literal
+/// contributed by a lookahead may sit outside the range.
+fn literal_may_match<S: input::Input + ?Sized>(
+    prefilter: &Option<literal::LiteralPrefilter>,
+    input: &RegexInput<'_, S>,
+) -> bool {
+    match prefilter {
+        Some(prefilter) if !input.is_anchored() => {
+            prefilter.may_match(input.haystack().as_bytes(), input.start())
+        }
+        _ => true,
     }
 }
 
